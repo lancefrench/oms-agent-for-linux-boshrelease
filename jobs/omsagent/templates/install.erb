@@ -1,7 +1,264 @@
 #!/bin/bash
 
-retry_create_symlinks()
-{
+# Primary Variables
+PRODUCT="omsagent"
+INSTALL_DIR="/var/vcap"
+SYSLOG_DIR="${INSTALL_DIR}/sys/log"
+PKG_DIR="${INSTALL_DIR}/packages/${PRODUCT}"
+DATA_DIR="${INSTALL_DIR}/data"
+INSTALLER=""
+DPKG_INSTALL_OPTS=("--force-confold" "--force-confdef")
+RPM_INSTALL_OPTS=("--force")
+CONTROLLER=""
+
+# Template Variables
+workspace_id=<%= p('oms.workspace_id') %>
+workspace_key=<%= p('oms.workspace_key') %>
+oms_top_level_domain=<%= p('oms.top_level_domain', "opinsights.azure.com") %>
+rsyslog_port=<%= p('rsyslog.port', 25224) %>
+
+# Package Variables and Versions
+## Order of the packages here matters. Removal will occur in order - left to right.
+## None of the packages depend on omsconfig, so it's first whereas omsagent depends on
+## scx and omi, so those have to be last.
+pkg_list=("omsconfig" "omsagent" "scx" "omi")
+
+## omsagent 
+omsagent_pkg="omsagent"
+omsagent_ver="1.12.15-0.universal.x64"
+omsagent_path="${PKG_DIR}/${omsagent_pkg}-${omsagent_ver}"
+
+## omsconfig
+omsconfig_pkg="omsconfig"
+omsconfig_ver="1.1.1-927.x64"
+omsconfig_path="${PKG_DIR}/${omsconfig_pkg}-${omsconfig_ver}"
+
+## omi
+omi_pkg="omi"
+omi_ver="1.6.3-0.ulinux.x64"
+omi_path="${PKG_DIR}/${omi_pkg}-${omi_ver}"
+
+## scx
+scx_pkg="scx"
+scx_ver="1.6.3-1079.universal.x64"
+scx_path="${PKG_DIR}/${scx_pkg}-${scx_ver}"
+
+# Utilize the functions later
+source "${PKG_DIR}/utils.sh"
+
+# Exit Codes
+DETECT_INSTALLER_FAILURE=65
+DETECT_CONTROLLER_FAILURE=66
+
+# Wrapper for exiting
+## $1 - exit code
+trigger_exit(){
+    echo "pre-start script exiting with code ${1}"
+    exit "${1}" 
+}
+
+# Verify the OS has dpkg or rpm package installer
+detect_installer(){
+    # Detect dpkg first
+    which dpkg > /dev/null 2>&1 && INSTALLER="DPKG"
+
+    # If dpkg wasn't found, check for rpm
+    if [[ -z "${INSTALLER}" ]]; then
+        which rpm > /dev/null 2>&1 && INSTALLER="RPM"
+
+        # If rpm and dpkg aren't found, script needs to fail and exit
+        if [[ -z "${INSTALLER}" ]]; then
+            echo "ERROR: Unable to detect a valid installer binary. \
+Valid installers are either \"dpkg\" or \"rpm\".
+
+Either the PATH environment variable needs updated, or this script is being \
+executed on an unsupported OS." >&2
+
+            trigger_exit "${DETECT_INSTALLER_FAILURE}"
+        fi
+    fi
+}
+
+# Check if omsagent is already installed
+detect_existing_install(){
+    # This section checks for existing omsagent and omsconfig packages already installed.
+    if [[ "${INSTALLER}" = "DPKG" ]]; then
+        dpkg -s "${pkg_list[@]}" 2> /dev/null | grep "^Status:" | grep installed > /dev/null 2>&1
+        OMS_FOUND="${?}"
+    else
+        rpm -q "${pkg_list[@]}" > /dev/null 2>&1
+        OMS_FOUND="${?}"
+    fi
+}
+
+detect_controller(){
+    # Check the PATH for systemctl
+    if which systemctl > /dev/null 2>&1; then
+        CONTROLLER="systemctl"
+
+    # Check for the binaries directly
+    else
+        if [[ -f "/bin/systemctl" ]]; then
+            CONTROLLER="systemctl"
+        elif [[ -f "/sbin/service" ]]; then
+            CONTROLLER="service"
+        elif [[ -f "/usr/sbin/invoke-rc.d" ]]; then
+            CONTROLLER="invoke-rc.d"
+        fi
+    fi
+
+    # Exit if no supported controllers found
+    if [[ -z "${CONTROLLER}" ]]; then
+        echo "ERROR: Unable to detect a supported controller.
+Supported Controllers are 'systemctl', 'service' and 'invoke-rc'." >&2
+
+        trigger_exit "${DETECT_CONTROLLER_FAILURE}"
+    fi
+}
+
+stop_oms_services(){
+    # Initializing variables
+    local service_stop=""
+    local service_disable=""
+    local service_kill=""
+    local sev=""
+    local sev_arry=()
+
+    # Regex for detecting the omsagent
+    reg="omsagent-[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
+
+    # Loop through any options provided
+    for stop_val in "${@}"; do
+        if [[ "${stop_val}" == "stop" ]]; then
+            service_stop="true"
+        fi
+
+        if [[ "${stop_val}" == "disable" ]]; then
+            service_disable="true"
+        fi
+
+        if [[ "${stop_val}" == "kill" ]]; then
+            service_kill="true"
+        fi
+
+        # Adds omsagent-workspace_id as one of the services to stop/disable/kill
+        if [[ "${stop_val}" == "current_ws" ]]; then
+            sev_array+=("omsagent-${workspace_id}")
+        fi
+
+        if [[ "${stop_val}" == "omsagent" ]]; then
+            sev_array+=("omsagent")
+        fi
+
+        if [[ "${stop_val}" == "omid" ]]; then
+            sev_array+=("omid")
+        fi
+    done
+
+    # Loop through all services added to the array
+    for sev in "${sev_array[@]}"; do
+        # invoke-rc.d method
+        if [[ "${CONTROLLER}" == "invoke-rc.d" ]]; then
+            if [[ "${sev}" == "omsagent" ]]; then
+                # Pull the name of the service
+                sev=$(ls /etc/init.d/ | grep -P "${reg}" -o)
+            fi
+
+            # Try to stop omsagent utilizing the controller
+            if [[ "${service_stop}" == "true" ]]; then
+                echo "Stopping ${sev} process via ${CONTROLLER}"
+                "${CONTROLLER}" "${sev}" stop
+
+                # for omid, try stopping it with the scxadmin binary too
+                if [[ "${sev}" == "omid" ]]; then
+                    scxadmin -stop all
+                fi
+            fi
+
+            # Try to disable and wipe out the init scripts
+            if [[ "${service_disable}" == "true" ]]; then
+                echo "Attempting to disable ${sev} from starting."
+                update-rc.d "${sev}" disable
+                rm -fv "/etc/init.d/${sev}" 2>/dev/null
+            fi
+
+        # service method
+        elif [[ "${CONTROLLER}" == "service" ]]; then
+            if [[ "${sev}" == "omsagent" ]]; then
+                # Pull the name of the service
+                sev=$(service --status-all | grep -P "${reg}" -o)
+            fi
+
+            # Try to stop omsagent utilizing the controller
+            if [[ "${service_stop}" == "true" ]]; then
+                echo "Stopping ${sev} process via ${CONTROLLER}"
+                "${CONTROLLER}" "${sev}" stop
+
+                # for omid, try stopping it with the scxadmin binary too
+                if [[ "${sev}" == "omid" ]]; then
+                    scxadmin -stop all
+                fi
+            fi
+
+            # Try to disable and wipe out the init scripts
+            if [[ "${service_disable}" == "true" ]]; then
+                echo "Attempting to disable ${sev} from starting."
+                chkconfig "${sev}" off
+                chkconfig --del "${sev}"
+                rm -fv "/etc/init.d/${sev}" 2>/dev/null
+            fi
+
+        # systemctl method
+        else
+            if [[ "${sev}" == "omsagent" ]]; then
+                # Pull the name of the service
+                sev=$("${CONTROLLER}" status | grep -P "${reg}" -o)
+            fi
+
+            if [[ "${service_stop}" == "true" ]]; then
+                echo "Stopping ${sev} process via ${CONTROLLER}"
+                "${CONTROLLER}" stop "${sev}"
+
+                # for omid, try stopping it with the scxadmin binary too
+                if [[ "${sev}" == "omid" ]]; then
+                    scxadmin -stop all
+                fi
+            fi
+
+            # Try to disable and wipe out the unit files
+            if [[ "${service_disable}" == "true" ]]; then
+                echo "Attempting to disable ${sev} from starting."
+                "${CONTROLLER}" disable "${sev}"
+                rm -fv "/lib/systemd/system/${sev}.service" 2>/dev/null
+            fi
+        fi
+
+        if [[ "service_kill" == "true" && "${sev}" != "omid" ]]; then
+            #ins=$(top -b -n 1 | grep omsagent)
+            echo "Attempting to kill any omsagent PIDs still running..."
+
+            # Pull PIDs for any process using the custom rsyslog port for omsagent
+            current_pids=$(sudo netstat -anop | grep ${rsyslog_port} | cut -c 81- | cut -d'/' -f 1 | cut -d'-' -f 1)
+
+            # Looping through the pids
+            for current_pid in "${current_pids}"; do
+                echo "Killing ${current_pid} "
+                kill -9 "${current_pid}"
+
+                #echo "${current_pid}" > "${PID_FILE_TEMP}"
+                #wait_until_process_stops $PID_FILE_TEMP 5
+            done
+
+            # Killing anything still running as the omsagent user
+            pkill -u omsagent > /dev/null 2>&1
+        fi
+    done
+}
+
+# This function is used to safely create the necessary symlinks
+## $1 - Symlink Existing Source/Target
+## $2 - Symlink Link Name
+retry_create_symlinks(){
     if [ -z "$1" ] || [ -z "$2" ]; then
         echo "Function \"retry_create_symlinks\" called with invalid parameter"
         exit 1
@@ -12,74 +269,55 @@ retry_create_symlinks()
 
     if [ ! -L $LINK ]; then
         RETRIES=2
+
         while [ $RETRIES -gt 0 ]; do
             # If $LINK exists and is a directory, backup the logs and then recreate it as a symlink
             if [ -d $LINK ]; then
                 mv -f $LINK/* $DIR/
                 rm -rf $LINK
             fi
+
+            # Create the symlink
             ln -s $DIR $LINK
+
+            # If the link exists, break out of the loop
             if [ -L $LINK ]; then
                 break
             fi
+
+            # Countdown to zero
             RETRIES=$((RETRIES - 1))
         done
+
         if [ $RETRIES -eq 0 ]; then
             echo "Failed to create symlink $LINK to $DIR"
         fi
     fi
 }
 
-# Utilize the functions later
-source /var/vcap/packages/omsagent/utils.sh
+main(){
+    # Verify the OS has a valid package installer
+    detect_installer
 
-workspace_id=<%= p('oms.workspace_id') %>
-workspace_key=<%= p('oms.workspace_key') %>
-oms_top_level_domain=<%= p('oms.top_level_domain', "opinsights.azure.com") %>
-rsyslog_port=<%= p('rsyslog.port', 25224) %>
+    # Detect the service controller
+    detect_controller
 
-# Detect dpkg
-which dpkg > /dev/null 2>&1
-DPKG_FOUND=$?
+    # Check if there is an existing omsagent installation
+    detect_existing_install
 
-# Stop existing agent
-reg="omsagent-[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
-sev=$(service --status-all | grep -P $reg -o)
-ins=$(top -b -n 1 | grep omsagent)
+    if [[ "${OMS_FOUND}" -eq 0 ]]; then
+        echo "Existing omsagent detected. Ensuring it's stopped and disabled."
 
-# This section checks for existing omsagent and omsconfig packages already installed.
-if [ "${DPKG_FOUND}" -eq 0 ]; then
-    dpkg -s omsagent omsconfig > /dev/null 2>&1
-    OMS_FOUND="${?}"
-else
-    rpm -q omsagent omsconfig > /dev/null 2>&1
-    OMS_FOUND="${?}"
-fi
-
-if [ ! -z "$sev" ] | [ ! -z "$ins" ] | [ "${OMS_FOUND}" -eq 0 ]; then
-    echo "Existing oms agent found $sev"
-    service "$sev" stop
-    rm -f /etc/init.d/omsagent*
-
-    echo -n "Terminating existing oms agent.. "
-    current_pids=$(sudo netstat -anop | grep ${rsyslog_port} | cut -c 81- | cut -d'/' -f 1 | cut -d'-' -f 1)
-    for current_pid in $current_pids; do
-      echo -n "$current_pid "
-      sudo kill -sigkill $current_pid
-      echo $current_pid > $PID_FILE_TEMP
-      wait_until_process_stops $PID_FILE_TEMP 5
-    done
-    echo ""
-
-    # Ensure nothing is running as the omsagent user
-    pkill -u omsagent > /dev/null 2>&1
+        # Stop existing omsagent processes
+        stop_oms_services stop disable kill omsagent
+    fi
+    exit 55
 
     if [ ${DPKG_FOUND} -eq 0 ]; then
         dpkg -r omsagent omsconfig
     else
         rpm -e omsagent omsconfig
     fi
-fi
 
 # Stop scx
 which scxadmin > /dev/null 2>&1
@@ -220,14 +458,17 @@ systemctl stop omsagent-${workspace_id}
 systemctl disable omsagent-${workspace_id}
 rm -f /lib/systemd/system/omsagent*
 
+# Attempting to stop omid before monit takes over
+echo "Stopping and disabling omid"
 scxadmin -stop all
-service omid stop
-rm -f /etc/init.d/omid
-systemctl stop omid
+service omid stop || systemctl stop omid
 systemctl disable omid
-rm -f /lib/systemd/system/omid.service
+rm -f /etc/init.d/omid || rm -f /lib/systemd/system/omid.service
 
 # Add the config for collecting uaa.log
 if [ -f /var/vcap/sys/log/uaa/uaa.log ]; then
     cp -f /var/vcap/packages/omsagent/oms.uaa.conf /etc/opt/microsoft/omsagent/conf/omsagent.d/uaa.conf
 fi
+}
+
+main "${@}"
