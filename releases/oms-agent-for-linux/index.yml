@@ -13,4 +13,6 @@ builds:
     version: 1.12.15-0+build9
   e5237202-0377-4255-54cd-889e403465f1:
     version: 1.12.15-0+build8
+  e9763924-1efe-4f75-4494-b334e5f873bc:
+    version: 1.12.15-0+build10
 format-version: "2"
