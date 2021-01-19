@@ -1,24 +1,24 @@
 omsagent/omi-1.6.3-0.ulinux.x64.deb:
   size: 1843922
-  sha: 5d6f87f33ed27f9edc421d2b680835537c52d258
+  sha: sha256:c2823e2deb14e428b213bf81bfb3056acc0b28885ec4b914c11f8cdf8d95cfb0
 omsagent/omi-1.6.3-0.ulinux.x64.rpm:
   size: 1910145
-  sha: 142e52fab8abea1e27aaf2321661ee6909e65d7a
+  sha: sha256:bac20501b308854cc6854fe10b1ad4ef35172af3a9d55ac976fae1c69e90aa15
 omsagent/omsagent-1.12.15-0.universal.x64.deb:
   size: 23123258
-  sha: fe486665d7424623357b248069a0764ab3814ad9
+  sha: sha256:74a55ac453bd03cec826d50d2de3cfed532e8b0d07c338bdf22f5cfa10325981
 omsagent/omsagent-1.12.15-0.universal.x64.rpm:
   size: 24245811
-  sha: 766ee5239cfcacc71c41300ba74f50e94f41b6c0
+  sha: sha256:db42102d25009e2597bc2f06a7735ea101264c0964511ac19e01ee652c238077
 omsagent/omsconfig-1.1.1-927.x64.deb:
   size: 6007750
-  sha: b53d655afbc27730ffe00fbf38e34138e7d1ac1d
+  sha: sha256:f0981d7c8d580a278bc4177118e86df416c74e24e1590bfc765b067584e4d00c
 omsagent/omsconfig-1.1.1-927.x64.rpm:
   size: 6063132
-  sha: e0ceec522f2b843bfba1219b8309bd7870367bda
+  sha: sha256:3cb4bc2fc18f71feb9cccbd64531f89c608c4591cb8e557c2ee6dbbd201deb7b
 omsagent/scx-1.6.3-1079.universal.x64.deb:
   size: 2053122
-  sha: 8cfb9489db5072d155a590af6329b5034d3dd2ad
+  sha: sha256:c2a887f521f99042215a845bee2cc2e2ac45e1f3a6759b883267665cd7295d5a
 omsagent/scx-1.6.3-1079.universal.x64.rpm:
   size: 2091795
-  sha: 2a05c89e1ae89532e6e84211f39da55a6e2d5465
+  sha: sha256:6eae8b6827e1a58b2ad210be3330b98bcfd91c61ab85121b455f68a81fc67127

@@ -1,11 +1,13 @@
 #!/bin/bash
+# Ran dos2unix on the file to cleanup the Windows CRLF end of lines.
+# Added these notes to ensure a change to the file was seen.
 
 is_process_running()
 {
     PIDFILE=$1
     # Returns 1 if 'omsagent' is running, 0 otherwise
     [ -f $PIDFILE ] || return 0
-    ps -p `cat $PIDFILE` | grep -q omsagent
+    ps -p `cat $PIDFILE` | grep -q "omsagent\|ruby"
     STATUS=$?
 
     # Kill PID file if we're not running any longer

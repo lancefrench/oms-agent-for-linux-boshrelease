@@ -30,6 +30,9 @@ retry_create_symlinks()
     fi
 }
 
+# Utilize the functions later
+source /var/vcap/packages/omsagent/utils.sh
+
 workspace_id=<%= p('oms.workspace_id') %>
 workspace_key=<%= p('oms.workspace_key') %>
 oms_top_level_domain=<%= p('oms.top_level_domain', "opinsights.azure.com") %>
@@ -44,21 +47,32 @@ reg="omsagent-[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-
 sev=$(service --status-all | grep -P $reg -o)
 ins=$(top -b -n 1 | grep omsagent)
 
-if [ ! -z "$sev" ] | [ ! -z "$ins" ]; then
+# This section checks for existing omsagent and omsconfig packages already installed.
+if [ "${DPKG_FOUND}" -eq 0 ]; then
+    dpkg -s omsagent omsconfig > /dev/null 2>&1
+    OMS_FOUND="${?}"
+else
+    rpm -q omsagent omsconfig > /dev/null 2>&1
+    OMS_FOUND="${?}"
+fi
+
+if [ ! -z "$sev" ] | [ ! -z "$ins" ] | [ "${OMS_FOUND}" -eq 0 ]; then
     echo "Existing oms agent found $sev"
-    sudo netstat -anop | grep ${rsyslog_port} | cut -c 81- | cut -d'/' -f 1 | cut -d'-' -f 1 | sudo xargs kill -s 9
     service "$sev" stop
     rm -f /etc/init.d/omsagent*
 
     echo -n "Terminating existing oms agent.. "
     current_pids=$(sudo netstat -anop | grep ${rsyslog_port} | cut -c 81- | cut -d'/' -f 1 | cut -d'-' -f 1)
     for current_pid in $current_pids; do
-      echo -n "$curent_pid "
+      echo -n "$current_pid "
       sudo kill -sigkill $current_pid
-      echo $curent_pid > $PID_FILE_TEMP
+      echo $current_pid > $PID_FILE_TEMP
       wait_until_process_stops $PID_FILE_TEMP 5
     done
     echo ""
+
+    # Ensure nothing is running as the omsagent user
+    pkill -u omsagent > /dev/null 2>&1
 
     if [ ${DPKG_FOUND} -eq 0 ]; then
         dpkg -r omsagent omsconfig
@@ -80,6 +94,12 @@ if [ ! -z $? ]; then
     else
         rpm -e omi scx
     fi
+fi
+
+# Removing the file to ensure onboarding is triggered upon re-installation.
+# Checks to see if the file exists, and that it is empty.
+if [ -f "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" -a ! -s "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" ]; then
+    rm -f "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered"
 fi
 
 # Redirect logs
@@ -138,11 +158,52 @@ usermod -aG vcap nxautomation
 # Install packages
 if [ ${DPKG_FOUND} -eq 0 ]; then
     (
+    # Get a lock to prevent other bad actors running dpkg commands
+    # e.g. bosh running parallel requests that might interfere
     flock -x 200
+
+    # Used as a timeout
+    DPKG_RETRIES=0
+
+    # Checks dpkg/apt related lock files to see if they're already locked and in use
+    # Also checks if DPKG_RETRIES hit the timeout value
+    while fuser /var/{lib/{dpkg,apt/lists},cache/apt/archives}/lock >/dev/null 2>&1 \
+&& [ "${DPKG_RETRIES}" -lt 300 ]; do
+        DPKG_RETRIES=$(( DPKG_RETRIES + 1 ))
+        sleep 1
+    done
+
     dpkg -i --force-confold --force-confdef /var/vcap/packages/omsagent/omi*.deb /var/vcap/packages/omsagent/scx*.deb /var/vcap/packages/omsagent/omsagent*.deb /var/vcap/packages/omsagent/omsconfig*.deb || true
     ) 200>/var/vcap/data/dpkg.lock
+
+    # Initializing to zero
+    pkg_count=0
+
+    # Get a count on the packages to see if all four were installed
+    pkg_count=$(dpkg -l omsagent omsconfig omi scx | grep -c "^ii ")
+
+    # Output some information and exit if all packages are not found.
+    if [[ "${pkg_count}" -ne 4 ]]; then
+        echo "Expected to find 4 packages, however only ${pkg_count} were detected. Some of the required \
+omsagent packages are missing. Exiting the installation as it has failed to install all packages."
+        exit 50
+    fi
+
 else
     rpm -Uvh --force /var/vcap/packages/omsagent/omi-*.rpm /var/vcap/packages/omsagent/scx*.rpm /var/vcap/packages/omsagent/omsagent*.rpm /var/vcap/packages/omsagent/omsconfig*.rpm || true
+
+    # Initializing to zero
+    pkg_count=0
+
+    # Get a count on the packages to see if all four were installed
+    pkg_count=$(rpm -q omsagent omsconfig omi scx | grep -v "is not installed" | wc -l)
+
+    # Output some information and exit if all packages are not found.
+    if [[ "${pkg_count}" -ne 4 ]]; then
+        echo "Expected to find 4 packages, however only ${pkg_count} were detected. Some of the required \
+omsagent packages are missing. Exiting the installation as it has failed to install all packages."
+        exit 50
+    fi
 fi
 
 chown -h omsagent:omiusers /var/opt/microsoft/omsconfig
@@ -159,6 +220,7 @@ systemctl stop omsagent-${workspace_id}
 systemctl disable omsagent-${workspace_id}
 rm -f /lib/systemd/system/omsagent*
 
+scxadmin -stop all
 service omid stop
 rm -f /etc/init.d/omid
 systemctl stop omid
