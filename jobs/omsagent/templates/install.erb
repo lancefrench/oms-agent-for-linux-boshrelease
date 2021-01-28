@@ -7,6 +7,7 @@ SYSLOG_DIR="${INSTALL_DIR}/sys/log"
 PKG_DIR="${INSTALL_DIR}/packages/${PRODUCT}"
 DATA_DIR="${INSTALL_DIR}/data"
 INSTALLER=""
+DPKG_TIMEOUT=300
 DPKG_INSTALL_OPTS=("--force-confold" "--force-confdef")
 RPM_INSTALL_OPTS=("--force")
 CONTROLLER=""
@@ -18,9 +19,6 @@ oms_top_level_domain=<%= p('oms.top_level_domain', "opinsights.azure.com") %>
 rsyslog_port=<%= p('rsyslog.port', 25224) %>
 
 # Package Variables and Versions
-## Order of the packages here matters. Removal will occur in order - left to right.
-## None of the packages depend on omsconfig, so it's first whereas omsagent depends on
-## scx and omi, so those have to be last.
 pkg_list=("omsconfig" "omsagent" "scx" "omi")
 
 ## omsagent 
@@ -49,11 +47,14 @@ source "${PKG_DIR}/utils.sh"
 # Exit Codes
 DETECT_INSTALLER_FAILURE=65
 DETECT_CONTROLLER_FAILURE=66
+STOP_OMS_SERVICE_NO_SERVICE=67
+PKG_CONTROL_NO_PACKAGE=68
+PKG_CONTROL_INVALID_ACTION=69
 
 # Wrapper for exiting
 ## $1 - exit code
 trigger_exit(){
-    echo "pre-start script exiting with code ${1}"
+    echo "ERROR: pre-start script exiting with code ${1}"
     exit "${1}" 
 }
 
@@ -91,6 +92,7 @@ detect_existing_install(){
     fi
 }
 
+# Detect the service controller
 detect_controller(){
     # Check the PATH for systemctl
     if which systemctl > /dev/null 2>&1; then
@@ -116,6 +118,7 @@ Supported Controllers are 'systemctl', 'service' and 'invoke-rc'." >&2
     fi
 }
 
+# Function for stopping, disabling and killing 
 stop_oms_services(){
     # Initializing variables
     local service_stop=""
@@ -124,7 +127,7 @@ stop_oms_services(){
     local sev=""
     local sev_arry=()
 
-    # Regex for detecting the omsagent
+    # Regex for detecting the omsagent service
     reg="omsagent-[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
 
     # Loop through any options provided
@@ -155,104 +158,238 @@ stop_oms_services(){
         fi
     done
 
-    # Loop through all services added to the array
-    for sev in "${sev_array[@]}"; do
-        # invoke-rc.d method
-        if [[ "${CONTROLLER}" == "invoke-rc.d" ]]; then
-            if [[ "${sev}" == "omsagent" ]]; then
-                # Pull the name of the service
-                sev=$(ls /etc/init.d/ | grep -P "${reg}" -o)
-            fi
+    # Check if sev_array is empty
+    if [[ "${#sev_array[@]}" -eq 0 ]]; then
+        echo -e "ERROR: No services provided to stop/disable/kill. Valid services are:
+\t'omsagent'
+\t'omid'
+\t'current_ws' (this will stop/disable/kill 'omsagent-<workspace_id>')" >&2
 
-            # Try to stop omsagent utilizing the controller
-            if [[ "${service_stop}" == "true" ]]; then
-                echo "Stopping ${sev} process via ${CONTROLLER}"
-                "${CONTROLLER}" "${sev}" stop
+        trigger_exit "${STOP_OMS_SERVICE_NO_SERVICE}"
 
-                # for omid, try stopping it with the scxadmin binary too
-                if [[ "${sev}" == "omid" ]]; then
-                    scxadmin -stop all
+    # Proceed if it is not empty
+    else
+        # Loop through all services added to the array
+        for sev in "${sev_array[@]}"; do
+            # invoke-rc.d method
+            if [[ "${CONTROLLER}" == "invoke-rc.d" ]]; then
+                if [[ "${sev}" == "omsagent" ]]; then
+                    # Pull the name of the service
+                    sev=$(ls /etc/init.d/ | grep -P "${reg}" -o)
+                fi
+    
+                # Try to stop omsagent utilizing the controller
+                if [[ "${service_stop}" == "true" && -n "${sev}" ]]; then
+                    echo "INFO: Stopping ${sev} process via ${CONTROLLER}"
+                    "${CONTROLLER}" "${sev}" stop
+    
+                    # for omid, try stopping it with the scxadmin binary too
+                    if [[ "${sev}" == "omid" ]]; then
+                        scxadmin -stop all
+                    fi
+                fi
+    
+                # Try to disable and wipe out the init scripts
+                if [[ "${service_disable}" == "true" && -n "${sev}" ]]; then
+                    echo "INFO: Attempting to disable ${sev} from starting."
+                    update-rc.d "${sev}" disable
+                    rm -fv "/etc/init.d/${sev}" 2>/dev/null
+                fi
+    
+            # service method
+            elif [[ "${CONTROLLER}" == "service" ]]; then
+                if [[ "${sev}" == "omsagent" ]]; then
+                    # Pull the name of the service
+                    sev=$(service --status-all | grep -P "${reg}" -o)
+                fi
+    
+                # Try to stop omsagent utilizing the controller
+                if [[ "${service_stop}" == "true" && -n "${sev}" ]]; then
+                    echo "INFO: Stopping ${sev} process via ${CONTROLLER}"
+                    "${CONTROLLER}" "${sev}" stop
+    
+                    # for omid, try stopping it with the scxadmin binary too
+                    if [[ "${sev}" == "omid" ]]; then
+                        scxadmin -stop all
+                    fi
+                fi
+    
+                # Try to disable and wipe out the init scripts
+                if [[ "${service_disable}" == "true" && -n "${sev}" ]]; then
+                    echo "INFO: Attempting to disable ${sev} from starting."
+                    chkconfig "${sev}" off
+                    chkconfig --del "${sev}"
+                    rm -fv "/etc/init.d/${sev}" 2>/dev/null
+                fi
+    
+            # systemctl method
+            else
+                if [[ "${sev}" == "omsagent" ]]; then
+                    # Pull the name of the service
+                    sev=$("${CONTROLLER}" status | grep -P "${reg}" -o)
+                fi
+    
+                if [[ "${service_stop}" == "true" && -n "${sev}" ]]; then
+                    echo "INFO: Stopping ${sev} process via ${CONTROLLER}"
+                    "${CONTROLLER}" stop "${sev}"
+    
+                    # for omid, try stopping it with the scxadmin binary too
+                    if [[ "${sev}" == "omid" ]]; then
+                        scxadmin -stop all
+                    fi
+                fi
+    
+                # Try to disable and wipe out the unit files
+                if [[ "${service_disable}" == "true" && -n "${sev}" ]]; then
+                    echo "INFO: Attempting to disable ${sev} from starting."
+                    "${CONTROLLER}" disable "${sev}"
+                    rm -fv "/lib/systemd/system/${sev}.service" 2>/dev/null
                 fi
             fi
+    
+            if [[ "${service_kill}" == "true" && "${sev}" != "omid" ]]; then
+                echo "INFO: Attempting to kill any omsagent PIDs still running..."
+    
+                # Pull PIDs for any process using the custom rsyslog port for omsagent
+                current_pids=$(sudo netstat -anop | grep ${rsyslog_port} | cut -c 81- | cut -d'/' -f 1 | cut -d'-' -f 1)
 
-            # Try to disable and wipe out the init scripts
-            if [[ "${service_disable}" == "true" ]]; then
-                echo "Attempting to disable ${sev} from starting."
-                update-rc.d "${sev}" disable
-                rm -fv "/etc/init.d/${sev}" 2>/dev/null
-            fi
-
-        # service method
-        elif [[ "${CONTROLLER}" == "service" ]]; then
-            if [[ "${sev}" == "omsagent" ]]; then
-                # Pull the name of the service
-                sev=$(service --status-all | grep -P "${reg}" -o)
-            fi
-
-            # Try to stop omsagent utilizing the controller
-            if [[ "${service_stop}" == "true" ]]; then
-                echo "Stopping ${sev} process via ${CONTROLLER}"
-                "${CONTROLLER}" "${sev}" stop
-
-                # for omid, try stopping it with the scxadmin binary too
-                if [[ "${sev}" == "omid" ]]; then
-                    scxadmin -stop all
+                # If the array has at least 1 or more PIDs detected, loop through and kill them
+                if [[ "${#current_pids[@]}" -gt 0 ]]; then 
+                    # Looping through the pids
+                    for current_pid in "${current_pids}"; do
+                        if [[ -n "${current_pid}" ]]; then
+                            echo "INFO: Killing ${current_pid} "
+                            kill -9 "${current_pid}"
+                        fi
+                    done
                 fi
+    
+                # Killing anything still running as the omsagent user
+                pkill -u omsagent > /dev/null 2>&1
             fi
+        done
+    fi
+}
 
-            # Try to disable and wipe out the init scripts
-            if [[ "${service_disable}" == "true" ]]; then
-                echo "Attempting to disable ${sev} from starting."
-                chkconfig "${sev}" off
-                chkconfig --del "${sev}"
-                rm -fv "/etc/init.d/${sev}" 2>/dev/null
-            fi
+# This function is used for installing or removing packages
+## $1 - [install|remove] : Tells the funtion it'll be either installing or removing packages
+## $2, $3, etc - [all|<pkg name>] : 'all' will install/remove the entire 'pkg_list' array, or 
+##                                  you can specify each package and it'll loop through them.
+pkg_control(){
+    local packages=()
+    local install_array=()
+    local pkg_action="${1}"
 
-        # systemctl method
+    # Ensure at least one package is provided
+    if [[ -z "${2}" ]]; then
+        echo -e "ERROR: No packages provided to pkg_control function. Unable to proceed." >&2
+        trigger_exit "${PKG_CONTROL_NO_PACKAGE}"
+    fi
+
+    # Install packages
+    if [[ "${pkg_action}" == "install" ]]; then
+        if [[ "${2}" == "all" ]]; then
+            install_array=("${pkg_list[@]}")
+
         else
-            if [[ "${sev}" == "omsagent" ]]; then
-                # Pull the name of the service
-                sev=$("${CONTROLLER}" status | grep -P "${reg}" -o)
-            fi
-
-            if [[ "${service_stop}" == "true" ]]; then
-                echo "Stopping ${sev} process via ${CONTROLLER}"
-                "${CONTROLLER}" stop "${sev}"
-
-                # for omid, try stopping it with the scxadmin binary too
-                if [[ "${sev}" == "omid" ]]; then
-                    scxadmin -stop all
-                fi
-            fi
-
-            # Try to disable and wipe out the unit files
-            if [[ "${service_disable}" == "true" ]]; then
-                echo "Attempting to disable ${sev} from starting."
-                "${CONTROLLER}" disable "${sev}"
-                rm -fv "/lib/systemd/system/${sev}.service" 2>/dev/null
-            fi
+            for pkg in "${@:2}"; do
+                install_array+=("${pkg}")
+            done
         fi
 
-        if [[ "service_kill" == "true" && "${sev}" != "omid" ]]; then
-            #ins=$(top -b -n 1 | grep omsagent)
-            echo "Attempting to kill any omsagent PIDs still running..."
-
-            # Pull PIDs for any process using the custom rsyslog port for omsagent
-            current_pids=$(sudo netstat -anop | grep ${rsyslog_port} | cut -c 81- | cut -d'/' -f 1 | cut -d'-' -f 1)
-
-            # Looping through the pids
-            for current_pid in "${current_pids}"; do
-                echo "Killing ${current_pid} "
-                kill -9 "${current_pid}"
-
-                #echo "${current_pid}" > "${PID_FILE_TEMP}"
-                #wait_until_process_stops $PID_FILE_TEMP 5
+        if [[ "${INSTALLER}" = "DPKG" ]]; then
+            # Building packages array with paths to each .deb package to install
+            for inst_pkg in "${install_array[@]}"; do
+                pkg_path="${inst_pkg}_path"
+    
+                packages+=("${!pkg_path}.deb")
             done
 
-            # Killing anything still running as the omsagent user
-            pkill -u omsagent > /dev/null 2>&1
+            # Perform the install
+            (
+            # Get a lock to prevent other bad actors running dpkg commands
+            # e.g. bosh running parallel requests that might interfere
+            flock -x 200
+        
+            # Used as a timeout
+            DPKG_RETRIES=0
+        
+            # Checks dpkg/apt related lock files to see if they're already locked and in use
+            # Also checks if DPKG_RETRIES hit the timeout value
+            while fuser /var/{lib/{dpkg,apt/lists},cache/apt/archives}/lock >/dev/null 2>&1 \
+&& [ "${DPKG_RETRIES}" -lt "${DPKG_TIMEOUT}" ]; do
+                DPKG_RETRIES=$(( DPKG_RETRIES + 1 ))
+                sleep 1
+            done
+
+            echo "INFO: Installing these packages: ${packages[@]}"
+            echo dpkg -i "${DPKG_INSTALL_OPTS}" "${packages[@]}" || true
+            ) 200>"${DATA_DIR}/dpkg.lock"
+
+        # RPM
+        else
+            # Building packages array with paths to each .deb package to install
+            for inst_pkg in "${install_array[@]}"; do
+                pkg_path="${inst_pkg}_path"
+
+                packages+=("${!pkg_path}.rpm")
+            done
+
+            # Perform the install
+            echo "INFO: Installing these packages: ${packages[@]}"
+            echo rpm -Uvh "${RPM_INSTALL_OPTS}" "${packages[@]}"
         fi
-    done
+
+    # Remove packages
+    elif [[ "${pkg_action}" == "remove" ]]; then
+        # If we're removing all packages
+        if [[ "${2}" == "all" ]]; then
+            packages=("${pkg_list[@]}")
+
+        # Otherwise build the array from packages provided skipping the first variable
+        else
+            for pkg in "${@:2}"; do
+                packages+=("${pkg}")
+            done
+        fi
+
+        # DPKG removal
+        if [[ "${INSTALLER}" = "DPKG" ]]; then
+            # dpkg lock control and perform the removal
+            (
+            # Get a lock to prevent other bad actors running dpkg commands
+            # e.g. bosh running parallel requests that might interfere
+            flock -x 200
+
+            # Used as a timeout
+            DPKG_RETRIES=0
+
+            # Checks dpkg/apt related lock files to see if they're already locked and in use
+            # Also checks if DPKG_RETRIES hit the timeout value
+            while fuser /var/{lib/{dpkg,apt/lists},cache/apt/archives}/lock >/dev/null 2>&1 \
+&& [ "${DPKG_RETRIES}" -lt "${DPKG_TIMEOUT}" ]; do
+                DPKG_RETRIES=$(( DPKG_RETRIES + 1 ))
+                sleep 1
+            done
+
+            echo "INFO: Removing these packages: ${packages[@]}"
+            echo dpkg -r "${packages[@]}"
+            ) 200>"${DATA_DIR}/dpkg.lock"
+
+        # RPM removal
+        else
+            echo "INFO: Removing these packages: ${packages[@]}"
+            echo rpm -e "${packages[@]}"
+        fi
+        
+    # Enters here if an invalid action is provided
+    else
+        echo -e "ERROR: Invalid action provided to pkg_control function. Valid actions are:
+\t'install'
+\t'remove'" >&2
+
+        trigger_exit "${PKG_CONTROL_INVALID_ACTION}"
+    fi
 }
 
 # This function is used to safely create the necessary symlinks
@@ -264,8 +401,8 @@ retry_create_symlinks(){
         exit 1
     fi
 
-    DIR=$1
-    LINK=$2
+    local DIR="${1}"
+    local LINK="${2}"
 
     if [ ! -L $LINK ]; then
         RETRIES=2
@@ -305,35 +442,32 @@ main(){
     # Check if there is an existing omsagent installation
     detect_existing_install
 
+    # Enters here if an existing omsagent installation was found
     if [[ "${OMS_FOUND}" -eq 0 ]]; then
-        echo "Existing omsagent detected. Ensuring it's stopped and disabled."
+        echo "INFO: Existing omsagent detected. Ensuring it's stopped and disabled."
 
         # Stop existing omsagent processes
         stop_oms_services stop disable kill omsagent
+
+        # Remove related packages
+        pkg_control remove omsconfig omsagent
     fi
+
+    # Check for scx, stop and remove it
+    which scxadmin > /dev/null 2>&1
+
+    # If scxadmin is detected
+    if [[ "${?}" -eq 0 ]]; then
+        echo "INFO: Detected 'scx' installed; stopping and removing related packages."
+
+        # Stop and disable omid which is controlled by scxadmin
+        stop_oms_services stop disable omid
+    
+        # Remove related packages
+        pkg_control remove omi scx
+    fi
+
     exit 55
-
-    if [ ${DPKG_FOUND} -eq 0 ]; then
-        dpkg -r omsagent omsconfig
-    else
-        rpm -e omsagent omsconfig
-    fi
-
-# Stop scx
-which scxadmin > /dev/null 2>&1
-if [ ! -z $? ]; then
-    echo "Stopping scx instances"
-    scxadmin -stop all
-    service omid stop
-    rm -f /etc/init.d/omid
-
-    if [ ${DPKG_FOUND} -eq 0 ]; then
-        dpkg -r omi scx
-    else
-        rpm -e omi scx
-    fi
-fi
-
 # Removing the file to ensure onboarding is triggered upon re-installation.
 # Checks to see if the file exists, and that it is empty.
 if [ -f "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" -a ! -s "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" ]; then
