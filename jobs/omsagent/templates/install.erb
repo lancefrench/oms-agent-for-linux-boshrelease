@@ -50,6 +50,10 @@ DETECT_CONTROLLER_FAILURE=66
 STOP_OMS_SERVICE_NO_SERVICE=67
 PKG_CONTROL_NO_PACKAGE=68
 PKG_CONTROL_INVALID_ACTION=69
+PKG_CONTROL_MISSING_PKGS_INSTALL_FAILURE=70
+RETRY_CREATE_SYMLINKS_TARGET_FAILURE=71
+RETRY_CREATE_SYMLINKS_LINK_NAME_FAILURE=72
+RETRY_CREATE_SYMLINKS_LINK_CREATE_FAILURE=73
 
 # Wrapper for exiting
 ## $1 - exit code
@@ -85,11 +89,11 @@ detect_existing_install(){
     # This section checks for existing omsagent and omsconfig packages already installed.
     if [[ "${INSTALLER}" = "DPKG" ]]; then
         dpkg -s "${pkg_list[@]}" 2> /dev/null | grep "^Status:" | grep installed > /dev/null 2>&1
-        OMS_FOUND="${?}"
     else
         rpm -q "${pkg_list[@]}" > /dev/null 2>&1
-        OMS_FOUND="${?}"
     fi
+
+    OMS_FOUND="${?}"
 }
 
 # Detect the service controller
@@ -119,13 +123,15 @@ Supported Controllers are 'systemctl', 'service' and 'invoke-rc'." >&2
 }
 
 # Function for stopping, disabling and killing 
+### Action options: [stop] [disable] [kill]
+### Services: [current_ws] [omsagent] [omid]
 stop_oms_services(){
     # Initializing variables
     local service_stop=""
     local service_disable=""
     local service_kill=""
     local sev=""
-    local sev_arry=()
+    local sev_array=()
 
     # Regex for detecting the omsagent service
     reg="omsagent-[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
@@ -263,7 +269,10 @@ stop_oms_services(){
                         fi
                     done
                 fi
-    
+
+                # Ensuring omiserver is stopped
+                pkill -f "bin/omiserver" > /dev/null 2>&1    
+
                 # Killing anything still running as the omsagent user
                 pkill -u omsagent > /dev/null 2>&1
             fi
@@ -272,8 +281,8 @@ stop_oms_services(){
 }
 
 # This function is used for installing or removing packages
-## $1 - [install|remove] : Tells the funtion it'll be either installing or removing packages
-## $2, $3, etc - [all|<pkg name>] : 'all' will install/remove the entire 'pkg_list' array, or 
+## $1 - [install|remove|verify] : The action to take on the packages
+## $2, $3, etc - [all|<pkg name>] : 'all' will install/remove/verify the entire 'pkg_list' array, or 
 ##                                  you can specify each package and it'll loop through them.
 pkg_control(){
     local packages=()
@@ -292,6 +301,7 @@ pkg_control(){
             install_array=("${pkg_list[@]}")
 
         else
+            # Looping through packages provided to the function
             for pkg in "${@:2}"; do
                 install_array+=("${pkg}")
             done
@@ -323,12 +333,12 @@ pkg_control(){
             done
 
             echo "INFO: Installing these packages: ${packages[@]}"
-            echo dpkg -i "${DPKG_INSTALL_OPTS}" "${packages[@]}" || true
+            dpkg -i "${DPKG_INSTALL_OPTS}" "${packages[@]}" || true
             ) 200>"${DATA_DIR}/dpkg.lock"
 
         # RPM
         else
-            # Building packages array with paths to each .deb package to install
+            # Building packages array with paths to each .rpm package to install
             for inst_pkg in "${install_array[@]}"; do
                 pkg_path="${inst_pkg}_path"
 
@@ -337,7 +347,7 @@ pkg_control(){
 
             # Perform the install
             echo "INFO: Installing these packages: ${packages[@]}"
-            echo rpm -Uvh "${RPM_INSTALL_OPTS}" "${packages[@]}"
+            rpm -Uvh "${RPM_INSTALL_OPTS}" "${packages[@]}"
         fi
 
     # Remove packages
@@ -373,52 +383,103 @@ pkg_control(){
             done
 
             echo "INFO: Removing these packages: ${packages[@]}"
-            echo dpkg -r "${packages[@]}"
+            dpkg -r "${packages[@]}"
             ) 200>"${DATA_DIR}/dpkg.lock"
 
         # RPM removal
         else
             echo "INFO: Removing these packages: ${packages[@]}"
-            echo rpm -e "${packages[@]}"
+            rpm -e "${packages[@]}"
+        fi
+
+    # Verifying packages are installed
+    elif [[ "${pkg_action}" == "verify" ]]; then
+        # If we're verifying all packages
+        if [[ "${2}" == "all" ]]; then
+            packages=("${pkg_list[@]}")
+
+        # Otherwise build the array from packages provided skipping the first variable
+        else
+            for pkg in "${@:2}"; do
+                packages+=("${pkg}")
+            done
+        fi
+
+        # Initializing vars
+        local pkg_count=0
+        local expected_count="${#packages[@]}"
+
+        # Pull the count on packages to see how many are installed
+        if [[ "${INSTALLER}" == "DPKG" ]]; then
+            pkg_count=$(dpkg -l "${packages[@]}" | grep -c "^ii ")
+        else
+            pkg_count=$(rpm -q "${packages[@]}" | grep -v "is not installed" | wc -l)
+        fi
+    
+        # Output some information and exit if all packages are not found.
+        if [[ "${pkg_count}" -ne "${expected_count}" ]]; then
+            echo "ERROR: Expected to find ${expected_count} package(s), \
+however only ${pkg_count} were detected. Some of the required omsagent \
+packages are missing.
+Exiting the installation as it has failed to install all required packages." >&2
+
+            trigger_exit "${PKG_CONTROL_MISSING_PKGS_INSTALL_FAILURE}"
         fi
         
     # Enters here if an invalid action is provided
     else
         echo -e "ERROR: Invalid action provided to pkg_control function. Valid actions are:
 \t'install'
-\t'remove'" >&2
+\t'remove'
+\t'verify'" >&2
 
         trigger_exit "${PKG_CONTROL_INVALID_ACTION}"
     fi
 }
 
 # This function is used to safely create the necessary symlinks
-## $1 - Symlink Existing Source/Target
+## $1 - Symlink Existing Target
 ## $2 - Symlink Link Name
 retry_create_symlinks(){
-    if [ -z "$1" ] || [ -z "$2" ]; then
-        echo "Function \"retry_create_symlinks\" called with invalid parameter"
-        exit 1
+    local TARGET="${1}"
+    local LINK_NAME="${2}"
+    local RETRIES=2
+
+    # Ensure we have a TARGET file/directory
+    if [[ -z "${TARGET}" ]]; then
+        echo -e "ERROR: Function 'retry_create_symlinks' called with the \
+TARGET file/directory missing." >&2
+        trigger_exit "${RETRY_CREATE_SYMLINKS_TARGET_FAILURE}"
     fi
 
-    local DIR="${1}"
-    local LINK="${2}"
+    # Ensure we have the expected link name
+    if [[ -z "${LINK_NAME}" ]]; then
+        echo -e "ERROR: Function 'retry_create_symlinks' called with the \
+expected link name missing." >&2
+        trigger_exit "${RETRY_CREATE_SYMLINKS_LINK_NAME_FAILURE}"
+    fi
 
-    if [ ! -L $LINK ]; then
-        RETRIES=2
+    # Verify that the expected link doesn't already exist as a symlink.
+    if [[ ! -L "${LINK_NAME}" ]]; then
+        while [[ "${RETRIES}" -gt 0 ]]; do
 
-        while [ $RETRIES -gt 0 ]; do
-            # If $LINK exists and is a directory, backup the logs and then recreate it as a symlink
-            if [ -d $LINK ]; then
-                mv -f $LINK/* $DIR/
-                rm -rf $LINK
+            # If LINK_NAME exists and is a directory, backup the logs and 
+            # then recreate it as a symlink
+            if [[ -d "${LINK_NAME}" ]]; then
+                echo "INFO: Link name exists as a directory. Backing up log \
+files and removing before attempting to create the symlink."
+
+                mv -vf ${LINK_NAME}/* "${TARGET}/"
+                rm -rvf "${LINK_NAME}"
             fi
 
             # Create the symlink
-            ln -s $DIR $LINK
+            echo "INFO: Attempting to create a symlink pointing ${LINK_NAME} to ${TARGET}"
+            ln -s "${TARGET}" "${LINK_NAME}"
 
             # If the link exists, break out of the loop
-            if [ -L $LINK ]; then
+            if [[ -L "${LINK_NAME}" ]]; then
+                echo "INFO: Link successfully created pointing ${LINK_NAME} to ${TARGET}"
                 break
             fi
 
@@ -426,10 +487,55 @@ retry_create_symlinks(){
             RETRIES=$((RETRIES - 1))
         done
 
-        if [ $RETRIES -eq 0 ]; then
-            echo "Failed to create symlink $LINK to $DIR"
+        # If we reach zero and the link still hasn't been created, then mark the creation
+        # as a failure and exit.
+        if [[ "${RETRIES}" -eq 0 ]]; then
+            echo "ERROR: Failed to create symlink pointing ${LINK_NAME} to ${TARGET}" >&2
+            trigger_exit "${RETRY_CREATE_SYMLINKS_LINK_CREATE_FAILURE}"
         fi
     fi
+}
+
+configure_users(){
+    local count=0
+
+    ### User/Group Creation and Permissions
+    echo "INFO: Using identity $(id)."
+
+    count=$(grep -c '^omsagent:' /etc/group)
+    if [[ "${count}" == 0 ]]; then
+        # Create new user group omsagent
+        echo "INFO: Creating group \"omsagent\""
+        groupadd -f "omsagent"
+    fi
+    
+    count=$(grep -c '^omiusers:' /etc/group)
+    if [ "${count}" == 0 ]; then
+        # Create new user group omiusers
+        echo "INFO: Creating group \"omiusers\""
+        groupadd -f "omiusers"
+    fi
+    
+    count=$(grep -c '^omsagent:' /etc/passwd)
+    if [ "${count}" == 0 ]; then
+        # Create new user account omsagent
+        echo "INFO: Creating user \"omsagent\""
+        useradd -M -N -s /bin/bash "omsagent"
+    fi
+
+    # Adding users to the appropriate groups
+    echo "INFO: Configuring groups"    
+    usermod -aG omsagent omsagent
+    usermod -aG omiusers omsagent
+    
+    # Permissions
+    echo "INFO: Ensuring permissions are correct."
+    chown -h omsagent:omiusers "${OPT_DIR}/microsoft/omsconfig"
+    chown -h omsagent:omsagent "${SYSLOG_DIR}/omsconfig"
+    
+    # Add oms users to vcap group for file system access
+    usermod -aG vcap omsagent
+    usermod -aG vcap nxautomation
 }
 
 main(){
@@ -467,142 +573,78 @@ main(){
         pkg_control remove omi scx
     fi
 
-    exit 55
-# Removing the file to ensure onboarding is triggered upon re-installation.
-# Checks to see if the file exists, and that it is empty.
-if [ -f "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" -a ! -s "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" ]; then
-    rm -f "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered"
-fi
+    # Removing the file to ensure onboarding is triggered upon re-installation.
+    # Checks to see if the file exists, and that it is empty before removal.
+    if [[ -f "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" && \
+! -s "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered" ]]; then
+        echo "INFO: '.service_registered' file detected - removing it now."
+        rm -vf "/etc/opt/microsoft/omsagent/${workspace_id}/conf/.service_registered"
+    fi
 
-# Redirect logs
-mkdir -p /var/vcap/sys/log/omi
-mkdir -p /var/vcap/sys/log/scx
-mkdir -p /var/vcap/sys/log/omsconfig
+    # Custom Directory Creation
+    mkdir -p "${OPT_DIR}/omi"
+    mkdir -p "${OPT_DIR}/microsoft/scx"
 
-mkdir -p /var/opt/omi
-mkdir -p /var/opt/microsoft/scx
+    ### These are for redirecting logs
+    mkdir -p "${SYSLOG_DIR}/omi"
+    mkdir -p "${SYSLOG_DIR}/scx"
+    mkdir -p "${SYSLOG_DIR}/omsconfig"
+    
+    # Create the symlinks for the above log directories 
+    retry_create_symlinks "${SYSLOG_DIR}/omi" "${OPT_DIR}/omi/log"
+    retry_create_symlinks "${SYSLOG_DIR}/scx" "${OPT_DIR}/microsoft/scx/log"
+    retry_create_symlinks "${SYSLOG_DIR}/omsconfig" "${OPT_DIR}/microsoft/omsconfig"
 
-retry_create_symlinks /var/vcap/sys/log/omi /var/opt/omi/log
-retry_create_symlinks /var/vcap/sys/log/scx /var/opt/microsoft/scx/log
-retry_create_symlinks /var/vcap/sys/log/omsconfig /var/opt/microsoft/omsconfig
+    # Ensures all necessary users/groups and permissions are configured
+    configure_users
 
-cp -f /var/vcap/packages/omsagent/logrotate.scx.conf /etc/logrotate.d/scx
+    # Copying logrotate for scx
+    if [[ -f "${PKG_DIR}/logrotate.scx.conf" ]]; then
+        echo "INFO: Installing logrotate config for scx."
+        cp -vf "${PKG_DIR}/logrotate.scx.conf" /etc/logrotate.d/scx
+    fi
 
-# Write the onboard config
-cat <<EOF > /etc/omsagent-onboard.conf
+    # Write the onboard config
+    echo "INFO: Creating omsagent-onboard.conf"
+    cat <<EOF > /etc/omsagent-onboard.conf
 WORKSPACE_ID=$workspace_id
 SHARED_KEY=$workspace_key
 URL_TLD=$oms_top_level_domain
 EOF
 
-# Setup user account and permission
-echo "Using identity $(id)"
+    # Ensure omsagent remnants aren't running
+    # Had issues with dpkg locks due to omiserver still running
+    stop_oms_services kill omsagent
 
-count=$(grep -c '^omsagent:' /etc/group)
-if [ "$count" == 0 ]; then
-    # Create new user group omsagent
-    groupadd -f "omsagent"
-fi
+    # Installing required packages
+    pkg_control install all
 
-count=$(grep -c '^omiusers:' /etc/group)
-if [ "$count" == 0 ]; then
-    # Create new user group omiusers
-    groupadd -f "omiusers"
-fi
+    # Verifying installation was successful
+    pkg_control verify all
 
-count=$(grep -c '^omsagent:' /etc/passwd)
-if [ "$count" == 0 ]; then
-    # Create new user account omsagent
-    useradd -M -N -s /bin/bash "omsagent"
-fi
+    # Ensures all necessary users/groups and permissions are configured
+    configure_users
 
-usermod -aG omsagent omsagent
-usermod -aG omiusers omsagent
-
-chown -h omsagent:omsagent /var/opt/microsoft/omsconfig
-chown -h omsagent:omiusers /var/opt/microsoft/omsconfig
-chown -h omsagent:omsagent /var/vcap/sys/log/omsconfig
-
-# Add oms users to vcap group for file system access
-usermod -aG vcap omsagent
-usermod -aG vcap nxautomation
-
-# Install packages
-if [ ${DPKG_FOUND} -eq 0 ]; then
-    (
-    # Get a lock to prevent other bad actors running dpkg commands
-    # e.g. bosh running parallel requests that might interfere
-    flock -x 200
-
-    # Used as a timeout
-    DPKG_RETRIES=0
-
-    # Checks dpkg/apt related lock files to see if they're already locked and in use
-    # Also checks if DPKG_RETRIES hit the timeout value
-    while fuser /var/{lib/{dpkg,apt/lists},cache/apt/archives}/lock >/dev/null 2>&1 \
-&& [ "${DPKG_RETRIES}" -lt 300 ]; do
-        DPKG_RETRIES=$(( DPKG_RETRIES + 1 ))
-        sleep 1
-    done
-
-    dpkg -i --force-confold --force-confdef /var/vcap/packages/omsagent/omi*.deb /var/vcap/packages/omsagent/scx*.deb /var/vcap/packages/omsagent/omsagent*.deb /var/vcap/packages/omsagent/omsconfig*.deb || true
-    ) 200>/var/vcap/data/dpkg.lock
-
-    # Initializing to zero
-    pkg_count=0
-
-    # Get a count on the packages to see if all four were installed
-    pkg_count=$(dpkg -l omsagent omsconfig omi scx | grep -c "^ii ")
-
-    # Output some information and exit if all packages are not found.
-    if [[ "${pkg_count}" -ne 4 ]]; then
-        echo "Expected to find 4 packages, however only ${pkg_count} were detected. Some of the required \
-omsagent packages are missing. Exiting the installation as it has failed to install all packages."
-        exit 50
+    # Backup the default configuration
+    # At every deployment the rsyslog config will be first restored from default and then changed according to job properties
+    if [[ ! -e "/etc/opt/microsoft/omsagent/sysconf/95-omsagent.conf.bk" ]]; then
+        echo "INFO: Backing up 95-omsagent.conf"
+        cp -v /etc/rsyslog.d/95-omsagent.conf /etc/opt/microsoft/omsagent/sysconf/95-omsagent.conf.bk
     fi
 
-else
-    rpm -Uvh --force /var/vcap/packages/omsagent/omi-*.rpm /var/vcap/packages/omsagent/scx*.rpm /var/vcap/packages/omsagent/omsagent*.rpm /var/vcap/packages/omsagent/omsconfig*.rpm || true
+    # Stop and disable current omsagent
+    stop_oms_services stop disable current_ws
 
-    # Initializing to zero
-    pkg_count=0
+    # Stop and disable omid
+    stop_oms_services stop disable omid
 
-    # Get a count on the packages to see if all four were installed
-    pkg_count=$(rpm -q omsagent omsconfig omi scx | grep -v "is not installed" | wc -l)
-
-    # Output some information and exit if all packages are not found.
-    if [[ "${pkg_count}" -ne 4 ]]; then
-        echo "Expected to find 4 packages, however only ${pkg_count} were detected. Some of the required \
-omsagent packages are missing. Exiting the installation as it has failed to install all packages."
-        exit 50
+    # Add the config for collecting uaa.log
+    if [[ -f "${SYSLOG_DIR}/uaa/uaa.log" ]]; then
+        echo "INFO: Installing uaa.conf for omsagent"
+        cp -vf "${PKG_DIR}/oms.uaa.conf" /etc/opt/microsoft/omsagent/conf/omsagent.d/uaa.conf
     fi
-fi
 
-chown -h omsagent:omiusers /var/opt/microsoft/omsconfig
-
-# Backup the default configuration, at every deployment the rsyslog config will be first restored from default and then changed according to job properties
-if [ ! -e /etc/opt/microsoft/omsagent/sysconf/95-omsagent.conf.bk ]; then
-    cp /etc/rsyslog.d/95-omsagent.conf /etc/opt/microsoft/omsagent/sysconf/95-omsagent.conf.bk
-fi
-
-# Disable the default service
-service omsagent-${workspace_id} stop
-rm -f /etc/init.d/omsagent*
-systemctl stop omsagent-${workspace_id}
-systemctl disable omsagent-${workspace_id}
-rm -f /lib/systemd/system/omsagent*
-
-# Attempting to stop omid before monit takes over
-echo "Stopping and disabling omid"
-scxadmin -stop all
-service omid stop || systemctl stop omid
-systemctl disable omid
-rm -f /etc/init.d/omid || rm -f /lib/systemd/system/omid.service
-
-# Add the config for collecting uaa.log
-if [ -f /var/vcap/sys/log/uaa/uaa.log ]; then
-    cp -f /var/vcap/packages/omsagent/oms.uaa.conf /etc/opt/microsoft/omsagent/conf/omsagent.d/uaa.conf
-fi
+    echo "INFO: Installation has completed successfully."
 }
 
 main "${@}"
